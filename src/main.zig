@@ -209,7 +209,10 @@ pub fn parse(allocator: std.mem.Allocator, src: []const u8) ![]Event {
             try events.append(.{ .start_other = aggregate.name });
             try events.appendSlice(aggregate.children);
             try events.append(.{ .close_other = aggregate.name });
-        }
+        } else if (try parseElement(src, &cursor)) |element| {
+            try events.append(.{ .flat_element = element.name });
+            if (element.value) |val| try events.append(.{ .text = val });
+        } else return error.Unexpected;
     }
 
     return events.toOwnedSlice();
@@ -253,7 +256,10 @@ fn parseAggregate(allocator: std.mem.Allocator, src: []const u8, cursor: *Cursor
     defer children.deinit();
     while (cursor.peek()) |token| {
         switch (token.tag) {
-            .eof, .close_ofx_tag => break,
+            .eof, .close_ofx_tag => {
+                cursor.* = start;
+                return null;
+            },
 
             .text => {
                 try children.append(.{ .text = token.loc });
@@ -267,7 +273,7 @@ fn parseAggregate(allocator: std.mem.Allocator, src: []const u8, cursor: *Cursor
                     try children.append(.{ .close_other = aggregate.name });
                 } else if (try parseElement(src, cursor)) |element| {
                     try children.append(.{ .flat_element = element.name });
-                    try children.append(.{ .text = element.value });
+                    if (element.value) |val| try children.append(.{ .text = val });
                 } else return error.Unexpected;
             },
             .angle_slash => {
@@ -281,21 +287,20 @@ fn parseAggregate(allocator: std.mem.Allocator, src: []const u8, cursor: *Cursor
                     return null;
                 }
 
-                break;
+                return Aggregate{
+                    .name = cursor.tokens[start_name_token].loc,
+                    .children = children.toOwnedSlice(),
+                };
             },
             .start_ofx_tag, .angle_close => return error.InvalidSyntax,
         }
     }
-
-    return Aggregate{
-        .name = cursor.tokens[start_name_token].loc,
-        .children = children.toOwnedSlice(),
-    };
+    std.debug.panic("Shouldn't exit while loop; eof should come before end", .{});
 }
 
 const Element = struct {
     name: Loc,
-    value: Loc,
+    value: ?Loc,
 };
 
 fn parseElement(src: []const u8, cursor: *Cursor) !?Element {
@@ -308,7 +313,7 @@ fn parseElement(src: []const u8, cursor: *Cursor) !?Element {
     const name_tok_idx = cursor.eat(.text) orelse return null;
     _ = cursor.eat(.angle_close) orelse return null;
 
-    const value_loc = mergeText(cursor) orelse return null;
+    const value_loc = mergeText(cursor);
 
     return Element{
         .name = cursor.tokens[name_tok_idx].loc,
@@ -652,7 +657,7 @@ const RandDocument = struct {
         var i: usize = 0;
         while (i < num_children) : (i += 1) {
             if (rand.boolean()) {
-                try randAggregate(rand, &names, &events, 32);
+                try randAggregate(rand, &names, &events, 16);
             } else {
                 try randElement(rand, &names, &events);
             }
@@ -944,6 +949,7 @@ fn randTagNameText(rand: std.rand.Random, buf: []u8) void {
 
 const TagName = proptest.String(u8, .{
     .min_len = 1,
+    .max_len = 64,
     .ranges = &.{
         .{ .min_max = .{ 'A', 'Z' } },
         .{ .min_max = .{ '0', '9' } },
@@ -954,6 +960,7 @@ const TagName = proptest.String(u8, .{
 // All ASCII characters except the angle brackets (`<` and `>`, 0x3C and 0x3E)
 const ValueText = proptest.String(u8, .{
     .min_len = 1,
+    .max_len = 1000,
     .ranges = &.{
         .{ .min_max = .{ ' ', ';' } },
         .{ .min_max = .{ '?', '~' } },

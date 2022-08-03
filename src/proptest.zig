@@ -45,6 +45,7 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
         //var rand_recorder = RandomRecorder{ .allocator = run_options.allocator, .parent = prng.random() };
         //defer rand_recorder.deinit();
 
+        std.debug.print("{s} iters {}\r", .{ src.fn_name, iterations });
         testFn(input) catch |initial_error| switch (initial_error) {
             error.PropTestDiscard => continue,
             else => {
