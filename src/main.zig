@@ -626,75 +626,11 @@ test "parse empty <OFX>" {
 }
 
 test "property: does not crash" {
-    const X = struct {
-        const Generator = proptest.Generator([]const u8);
-        fn createASCII(allocator: std.mem.Allocator, rand: std.rand.Random) ![]const u8 {
-            const ascii = try allocator.alloc(u8, rand.uintLessThan(usize, 50 * 1024));
-            for (ascii) |*c| {
-                c.* = rand.int(u7);
-            }
-            return ascii;
-        }
-
-        fn destroyASCII(ascii: []const u8, allocator: std.mem.Allocator) void {
-            allocator.free(ascii);
-        }
-
-        const Tactic = enum(u32) {
-            take_front_half,
-            take_back_half,
-            simplify_front_half,
-            simplify_back_half,
-            remove_last_char,
-            remove_first_char,
-            simplify_last_char,
-            simplify_first_char,
-            _,
-        };
-
-        fn shrinkASCII(ascii: []const u8, allocator: std.mem.Allocator, _: std.rand.Random, tactic: u32) !Generator.Result {
-            if (ascii.len == 0) return Generator.Result.no_more_tactics;
-            switch (@intToEnum(Tactic, tactic)) {
-                .take_front_half => return Generator.Result{ .shrunk = try allocator.dupe(u8, ascii[0 .. ascii.len / 2]) },
-                .take_back_half => return Generator.Result{ .shrunk = try allocator.dupe(u8, ascii[ascii.len / 2 ..]) },
-                .simplify_front_half => {
-                    const new = try allocator.dupe(u8, ascii);
-                    std.mem.set(u8, new[0 .. ascii.len / 2], 'a');
-                    return Generator.Result{ .shrunk = new };
-                },
-                .simplify_back_half => {
-                    const new = try allocator.dupe(u8, ascii);
-                    std.mem.set(u8, new[ascii.len / 2 ..], 'a');
-                    return Generator.Result{ .shrunk = new };
-                },
-                .remove_last_char => return Generator.Result{ .shrunk = try allocator.dupe(u8, ascii[0 .. ascii.len - 1]) },
-                .remove_first_char => return Generator.Result{ .shrunk = try allocator.dupe(u8, ascii[1..]) },
-
-                .simplify_last_char => {
-                    const new = try allocator.dupe(u8, ascii);
-                    new[ascii.len - 1] = 'a';
-                    return Generator.Result{ .shrunk = new };
-                },
-                .simplify_first_char => {
-                    const new = try allocator.dupe(u8, ascii);
-                    new[0] = 'a';
-                    return Generator.Result{ .shrunk = new };
-                },
-
-                _ => return Generator.Result.no_more_tactics,
-            }
-        }
-
-        fn printASCII(ascii: []const u8) void {
-            std.debug.print("{s}", .{ascii});
-        }
-    };
-    try proptest.run(@src(), .{}, []const u8, .{
-        .create = X.createASCII,
-        .destroy = X.destroyASCII,
-        .shrink = X.shrinkASCII,
-        .print = X.printASCII,
-    }, testDoesNotCrash);
+    const AsciiDocument = proptest.String(u8, .{ .ranges = &.{
+        .{ .list = "\n\t\r" },
+        .{ .min_max = .{ ' ', '~' } },
+    } });
+    try proptest.run(@src(), .{}, []const u8, AsciiDocument.generator(), testDoesNotCrash);
 }
 
 fn testDoesNotCrash(test_case: []const u8) !void {
@@ -743,9 +679,7 @@ const RandDocument = struct {
     names: []const u8,
     events: []const Event,
 
-    const Generator = proptest.Generator(@This());
-
-    fn generator() Generator {
+    fn generator() proptest.Generator(@This()) {
         return .{
             .create = create,
             .destroy = destroy,
@@ -792,17 +726,24 @@ const RandDocument = struct {
         remove_all_but_first_two,
         remove_text,
         remove_last_half,
+        simplify_other_tags,
+        simplify_other_tags1,
+        simplify_other_tags2,
         _,
     };
 
-    fn shrink(this: @This(), allocator: std.mem.Allocator, _: std.rand.Random, tactic: u32) !Generator.Result {
-        if (this.events.len <= 2) return Generator.Result.no_more_tactics;
+    fn shrink(this: @This(), allocator: std.mem.Allocator, rand: std.rand.Random, tactic: u32) !proptest.Result(@This()) {
+        const Res = proptest.Result(@This());
+        if (this.events.len <= 2) return Res.no_more_tactics;
 
+        var new_names = std.ArrayList(u8).init(allocator);
+        defer new_names.deinit();
         var new_events = std.ArrayList(Event).init(allocator);
         defer new_events.deinit();
         switch (@intToEnum(Tactic, tactic)) {
             .remove_all_but_first_two => {
-                if (this.events.len <= 4) return Generator.Result.dead_end;
+                if (this.events.len <= 4) return Res.dead_end;
+                try new_names.appendSlice(this.names);
                 var level: usize = 0;
                 for (this.events[0..2]) |event| {
                     try new_events.append(event);
@@ -827,12 +768,14 @@ const RandDocument = struct {
                 }
             },
             .remove_text => {
+                try new_names.appendSlice(this.names);
                 for (this.events) |event| {
                     if (event == .text) continue;
                     try new_events.append(event);
                 }
             },
             .remove_last_half => {
+                try new_names.appendSlice(this.names);
                 var level: usize = 0;
                 for (this.events[0 .. this.events.len / 2]) |event| {
                     if (event.isStart()) {
@@ -857,22 +800,87 @@ const RandDocument = struct {
                     }
                 }
             },
-            _ => return Generator.Result.no_more_tactics,
+            .simplify_other_tags, .simplify_other_tags1, .simplify_other_tags2 => {
+                var loc_updates = std.AutoHashMap(Loc, Loc).init(allocator);
+                defer loc_updates.deinit();
+
+                for (this.events) |event| {
+                    switch (event) {
+                        .flat_element,
+                        .text,
+                        .start_other,
+                        .close_other,
+                        .fid,
+                        .org,
+                        .curdef,
+                        .bankid,
+                        .acctid,
+                        .accttype,
+                        .trntype,
+                        .dtposted,
+                        .trnamt,
+                        .fitid,
+                        .name,
+                        .memo,
+                        .balamt,
+                        .dtasof,
+                        => |loc| {
+                            const gop = try loc_updates.getOrPut(loc);
+                            if (!gop.found_existing) {
+                                if (std.mem.eql(u8, "OFX", loc.text(this.names))) {
+                                    gop.value_ptr.* = try appendTextLoc(&new_names, loc.text("OFX"));
+                                } else switch (try TagName.shrink(loc.text(this.names), allocator, rand, tactic - @enumToInt(Tactic.simplify_other_tags))) {
+                                    .shrunk => |tag_name_simplified| {
+                                        gop.value_ptr.* = try appendTextLoc(&new_names, tag_name_simplified);
+                                        allocator.free(tag_name_simplified);
+                                    },
+                                    .dead_end, .no_more_tactics => {
+                                        gop.value_ptr.* = try appendTextLoc(&new_names, loc.text(this.names));
+                                    },
+                                }
+                            }
+                            try new_events.append(switch (event) {
+                                .flat_element => .{ .flat_element = gop.value_ptr.* },
+                                .text => .{ .text = gop.value_ptr.* },
+                                .start_other => .{ .start_other = gop.value_ptr.* },
+                                .close_other => .{ .close_other = gop.value_ptr.* },
+                                .fid => .{ .fid = gop.value_ptr.* },
+                                .org => .{ .org = gop.value_ptr.* },
+                                .curdef => .{ .curdef = gop.value_ptr.* },
+                                .bankid => .{ .bankid = gop.value_ptr.* },
+                                .acctid => .{ .acctid = gop.value_ptr.* },
+                                .accttype => .{ .accttype = gop.value_ptr.* },
+                                .trntype => .{ .trntype = gop.value_ptr.* },
+                                .dtposted => .{ .dtposted = gop.value_ptr.* },
+                                .trnamt => .{ .trnamt = gop.value_ptr.* },
+                                .fitid => .{ .fitid = gop.value_ptr.* },
+                                .name => .{ .name = gop.value_ptr.* },
+                                .memo => .{ .memo = gop.value_ptr.* },
+                                .balamt => .{ .balamt = gop.value_ptr.* },
+                                .dtasof => .{ .dtasof = gop.value_ptr.* },
+                                else => std.debug.panic("nested switch should be a subset", .{}),
+                            });
+                        },
+                        else => try new_events.append(event),
+                    }
+                }
+            },
+            _ => return Res.no_more_tactics,
         }
 
         for (new_events.items) |new_event, i| {
-            if (!new_event.eql(this.names, this.events[i], this.names)) {
+            if (!new_event.eql(new_names.items, this.events[i], this.names)) {
                 break;
             }
         } else {
-            return Generator.Result.dead_end;
+            return Res.dead_end;
         }
 
         std.debug.assert(std.mem.eql(u8, "OFX", new_events.items[0].start_other.text(this.names)));
         std.debug.assert(std.mem.eql(u8, "OFX", new_events.items[new_events.items.len - 1].close_other.text(this.names)));
-        return Generator.Result{
+        return Res{
             .shrunk = @This(){
-                .names = try allocator.dupe(u8, this.names),
+                .names = new_names.toOwnedSlice(),
                 .events = new_events.toOwnedSlice(),
             },
         };
@@ -948,6 +956,15 @@ fn randTagNameText(rand: std.rand.Random, buf: []u8) void {
     }
 }
 
+const TagName = proptest.String(u8, .{
+    .min_len = 1,
+    .ranges = &.{
+        .{ .min_max = .{ 'A', 'Z' } },
+        .{ .min_max = .{ '0', '9' } },
+        .{ .list = ":_-." },
+    },
+});
+
 fn randValue(rand: std.rand.Random, names: *std.ArrayList(u8)) !Loc {
     const loc = try appendNLoc(names, rand.intRangeLessThan(usize, 1, 1024));
     try randValueText(rand, names.items[loc.start..loc.end]);
@@ -973,13 +990,6 @@ fn randCodepoint(comptime T: type, rand: std.rand.Random, alphabet: []const T) T
     } else {
         // 7/8th of the time, pull from the first 256 elements in alphabet
         return alphabet[0..256][rand.int(u8)];
-    }
-}
-
-/// Fill the given buffer with random ascii text
-fn randASCII(rand: std.rand.Random, buf: []u8) void {
-    for (buf) |*c| {
-        c.* = rand.int(u7);
     }
 }
 

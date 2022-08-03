@@ -12,18 +12,20 @@ const RunOptions = struct {
     max_iterations: usize = 100,
 };
 
+pub fn Result(comptime Input: type) type {
+    return union(enum) {
+        shrunk: Input,
+        dead_end,
+        no_more_tactics,
+    };
+}
+
 pub fn Generator(comptime Input: type) type {
     return struct {
         create: fn (std.mem.Allocator, std.rand.Random) anyerror!Input,
         destroy: fn (Input, std.mem.Allocator) void,
-        shrink: fn (Input, std.mem.Allocator, std.rand.Random, tactic: u32) anyerror!Result,
+        shrink: fn (Input, std.mem.Allocator, std.rand.Random, tactic: u32) anyerror!Result(Input),
         print: fn (Input) void,
-
-        pub const Result = union(enum) {
-            shrunk: Input,
-            dead_end,
-            no_more_tactics,
-        };
     };
 }
 
@@ -45,7 +47,6 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
         testFn(input) catch |initial_error| switch (initial_error) {
             error.PropTestDiscard => continue,
             else => {
-                std.debug.print("initial error = {}\n", .{initial_error});
                 // Try to shrink test case
                 var tactic: u32 = 0;
                 var current_input = input;
@@ -55,30 +56,25 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
                     const new_input = switch (try generator.shrink(current_input, run_options.allocator, new_prng.random(), tactic)) {
                         .shrunk => |new| new,
                         .dead_end => {
-                            std.debug.print("dead end\n", .{});
                             tactic += 1;
                             continue;
                         },
                         .no_more_tactics => {
-                            std.debug.print("no more tactics!\n", .{});
                             break;
                         },
                     };
                     if (testFn(new_input)) {
                         // The test succeeded, so our simplification didn't work.
                         // Change tactics and continue.
-                        std.debug.print("error was removed, reverting\n", .{});
                         tactic += 1;
                         generator.destroy(new_input, run_options.allocator);
                     } else |e| if (e == initial_error) {
-                        std.debug.print("new error = {}\n", .{e});
                         // We got the same error back out! Continue simplifying with the new input, resetting the tactics we're using
                         tactic = 0;
                         generator.destroy(current_input, run_options.allocator);
                         current_input = new_input;
                         current_error = e;
                     } else {
-                        std.debug.print("error changed ({}), reverting\n", .{e});
                         tactic += 1;
                     }
                 }
@@ -202,3 +198,197 @@ const RandomReplayer = struct {
         }
     }
 };
+
+pub fn String(comptime T: type, comptime options: struct {
+    ranges: []const Range(T) = &.{.{ .min_max = .{ 0, std.math.maxInt(T) } }},
+    min_len: usize = 0,
+    max_len: usize = 50 * 1024,
+}) type {
+    const StringCharacter = Character(T, options.ranges);
+
+    return struct {
+        pub fn generator() Generator([]const u8) {
+            return .{
+                .create = create,
+                .destroy = destroy,
+                .shrink = shrink,
+                .print = print,
+            };
+        }
+
+        pub fn create(allocator: std.mem.Allocator, rand: std.rand.Random) ![]const T {
+            const buf = try allocator.alloc(u8, rand.intRangeLessThan(usize, options.min_len, options.max_len));
+            for (buf) |*element| {
+                element.* = try StringCharacter.create(allocator, rand);
+            }
+            return buf;
+        }
+
+        pub fn destroy(buf: []const T, allocator: std.mem.Allocator) void {
+            allocator.free(buf);
+        }
+
+        const Tactic = enum(u32) {
+            take_front_half,
+            take_back_half,
+            simplify,
+            simplify_front_half,
+            simplify_back_half,
+            remove_last_char,
+            remove_first_char,
+            simplify_last_char,
+            simplify_first_char,
+            _,
+        };
+
+        const Res = Result([]const T);
+        pub fn shrink(buf: []const T, allocator: std.mem.Allocator, rand: std.rand.Random, tactic: u32) !Res {
+            if (buf.len <= options.min_len) return Res.no_more_tactics;
+            switch (@intToEnum(Tactic, tactic)) {
+                .take_front_half => {
+                    if (buf.len / 2 < options.min_len) return Res.dead_end;
+                    return Res{ .shrunk = try allocator.dupe(T, buf[0 .. buf.len / 2]) };
+                },
+                .take_back_half => {
+                    if (buf.len / 2 < options.min_len) return Res.dead_end;
+                    return Res{ .shrunk = try allocator.dupe(T, buf[buf.len / 2 ..]) };
+                },
+                .simplify => {
+                    const new = try allocator.dupe(T, buf);
+                    for (new) |*element| {
+                        switch (try StringCharacter.shrink(element.*, allocator, rand, 0)) {
+                            .shrunk => |new_char| element.* = new_char,
+                            .dead_end, .no_more_tactics => return Res.dead_end,
+                        }
+                    }
+                    return Res{ .shrunk = new };
+                },
+                .simplify_front_half => {
+                    const new = try allocator.dupe(T, buf);
+                    for (new[0 .. buf.len / 2]) |*element| {
+                        switch (try StringCharacter.shrink(element.*, allocator, rand, 0)) {
+                            .shrunk => |new_char| element.* = new_char,
+                            .dead_end, .no_more_tactics => return Res.dead_end,
+                        }
+                    }
+                    return Res{ .shrunk = new };
+                },
+                .simplify_back_half => {
+                    const new = try allocator.dupe(T, buf);
+                    for (new[new.len / 2 ..]) |*element| {
+                        switch (try StringCharacter.shrink(element.*, allocator, rand, 0)) {
+                            .shrunk => |new_char| element.* = new_char,
+                            .dead_end, .no_more_tactics => return Res.dead_end,
+                        }
+                    }
+                    return Res{ .shrunk = new };
+                },
+                .remove_last_char => return Res{ .shrunk = try allocator.dupe(u8, buf[0 .. buf.len - 1]) },
+                .remove_first_char => return Res{ .shrunk = try allocator.dupe(u8, buf[1..]) },
+
+                .simplify_last_char => {
+                    switch (try StringCharacter.shrink(buf[buf.len - 1], allocator, rand, 0)) {
+                        .shrunk => |new_char| {
+                            const new = try allocator.dupe(T, buf);
+                            new[buf.len - 1] = new_char;
+                            return Res{ .shrunk = new };
+                        },
+                        .dead_end, .no_more_tactics => {
+                            return Res.dead_end;
+                        },
+                    }
+                },
+                .simplify_first_char => {
+                    switch (try StringCharacter.shrink(buf[0], allocator, rand, 0)) {
+                        .shrunk => |new_char| {
+                            const new = try allocator.dupe(T, buf);
+                            new[0] = new_char;
+                            return Res{ .shrunk = new };
+                        },
+                        .dead_end, .no_more_tactics => {
+                            return Res.dead_end;
+                        },
+                    }
+                },
+
+                _ => return Res.no_more_tactics,
+            }
+        }
+
+        pub fn print(ascii: []const u8) void {
+            std.debug.print("{s}\n", .{ascii});
+        }
+    };
+}
+
+pub fn Range(comptime T: type) type {
+    return union(enum) {
+        list: []const T,
+        min_max: [2]T,
+
+        pub fn valueAt(this: @This(), index: usize) T {
+            switch (this) {
+                .list => |l| return l[index],
+                .min_max => |r| return r[0] + @intCast(T, index),
+            }
+        }
+
+        pub fn size(this: @This()) usize {
+            switch (this) {
+                .list => |l| return l.len,
+                .min_max => |r| {
+                    std.debug.assert(r[0] < r[1]);
+                    return r[1] - r[0] + 1;
+                },
+            }
+        }
+    };
+}
+
+pub fn Character(comptime T: type, comptime ranges: []const Range(T)) type {
+    std.debug.assert(ranges.len > 0);
+    // TODO: Ensure that none of the ranges overlap
+    var total: usize = 0;
+    for (ranges) |range| {
+        total += range.size();
+    }
+    const total_number_of_characters = total;
+    return struct {
+        fn create(_: std.mem.Allocator, rand: std.rand.Random) !T {
+            const idx = rand.uintLessThan(usize, total_number_of_characters);
+            var range_start: usize = 0;
+            for (ranges) |range| {
+                const range_end = range_start + range.size();
+                if (range_start <= idx and idx < range_end) {
+                    return range.valueAt(idx - range_start);
+                }
+                range_start = range_end;
+            } else {
+                std.debug.panic("index not in ranges! {}", .{idx});
+            }
+        }
+
+        fn destroy(_: T, _: std.mem.Allocator) void {}
+
+        const Tactic = enum(u32) {
+            change_to_first,
+            _,
+        };
+
+        const Res = Result(T);
+        fn shrink(current: T, _: std.mem.Allocator, _: std.rand.Random, tactic: u32) !Res {
+            switch (@intToEnum(Tactic, tactic)) {
+                .change_to_first => {
+                    const first = ranges[0].valueAt(0);
+                    if (current == first) return Res.dead_end;
+                    return Res{ .shrunk = first };
+                },
+                _ => return Res.no_more_tactics,
+            }
+        }
+
+        fn print(value: T) void {
+            std.debug.print("\'{'}\' ({}, 0x{x})\n", .{ std.zig.fmtEscapes(value), value, value });
+        }
+    };
+}
