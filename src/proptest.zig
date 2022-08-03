@@ -10,6 +10,7 @@ const RunOptions = struct {
     allocator: std.mem.Allocator = std.testing.allocator,
     cache_path: []const u8 = "zig-cache/test-cases",
     max_iterations: usize = 100,
+    print_value: bool = true,
 };
 
 pub fn Result(comptime Input: type) type {
@@ -76,12 +77,17 @@ pub fn run(src: std.builtin.SourceLocation, run_options: RunOptions, comptime In
                         current_error = e;
                     } else {
                         tactic += 1;
+                        generator.destroy(new_input, run_options.allocator);
                     }
                 }
 
                 // Print input
-                std.debug.print("{s} failed with input:\n", .{src.fn_name});
-                generator.print(current_input);
+                std.debug.print("{s} failed with error: {}\n", .{ src.fn_name, current_error });
+                if (run_options.print_value) {
+                    generator.print(current_input);
+                    std.debug.print("\n", .{});
+                }
+
                 generator.destroy(current_input, run_options.allocator);
                 return current_error;
             },
@@ -255,31 +261,55 @@ pub fn String(comptime T: type, comptime options: struct {
                 },
                 .simplify => {
                     const new = try allocator.dupe(T, buf);
+                    var any_shrunk = false;
                     for (new) |*element| {
                         switch (try StringCharacter.shrink(element.*, allocator, rand, 0)) {
-                            .shrunk => |new_char| element.* = new_char,
-                            .dead_end, .no_more_tactics => return Res.dead_end,
+                            .shrunk => |new_char| {
+                                any_shrunk = true;
+                                element.* = new_char;
+                            },
+                            .dead_end, .no_more_tactics => {},
                         }
+                    }
+                    if (!any_shrunk) {
+                        allocator.free(new);
+                        return Res.dead_end;
                     }
                     return Res{ .shrunk = new };
                 },
                 .simplify_front_half => {
                     const new = try allocator.dupe(T, buf);
+                    var any_shrunk = false;
                     for (new[0 .. buf.len / 2]) |*element| {
                         switch (try StringCharacter.shrink(element.*, allocator, rand, 0)) {
-                            .shrunk => |new_char| element.* = new_char,
-                            .dead_end, .no_more_tactics => return Res.dead_end,
+                            .shrunk => |new_char| {
+                                any_shrunk = true;
+                                element.* = new_char;
+                            },
+                            .dead_end, .no_more_tactics => {},
                         }
+                    }
+                    if (!any_shrunk) {
+                        allocator.free(new);
+                        return Res.dead_end;
                     }
                     return Res{ .shrunk = new };
                 },
                 .simplify_back_half => {
                     const new = try allocator.dupe(T, buf);
+                    var any_shrunk = false;
                     for (new[new.len / 2 ..]) |*element| {
                         switch (try StringCharacter.shrink(element.*, allocator, rand, 0)) {
-                            .shrunk => |new_char| element.* = new_char,
-                            .dead_end, .no_more_tactics => return Res.dead_end,
+                            .shrunk => |new_char| {
+                                any_shrunk = true;
+                                element.* = new_char;
+                            },
+                            .dead_end, .no_more_tactics => {},
                         }
+                    }
+                    if (!any_shrunk) {
+                        allocator.free(new);
+                        return Res.dead_end;
                     }
                     return Res{ .shrunk = new };
                 },
